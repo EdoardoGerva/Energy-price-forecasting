@@ -1,4 +1,4 @@
-# Energy-price-forecasting-
+# Energy-price-forecasting
 
 Rmd files used in Streaming Data Management and Time Series Analysis project.
 
