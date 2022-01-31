@@ -1,0 +1,333 @@
+---
+title: "SDMTSA_Project_NonLinearModels"
+author: "eg"
+date: "27/6/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Carico le librerie necessarie allo svolgimento del progetto
+```{r}
+library(forecast)
+library(KFAS)
+library(tidyverse)
+library(ggplot2)
+library(xts)
+library(urca)
+library(plotly)
+library(naniar)
+library(prophet)
+library(tseries)
+library(fastDummies)
+library(bizdays)
+library(RQuantLib)
+library(lubridate)
+library(reticulate)
+library(tsfknn)
+library(keras)
+library(skmeans)
+library(tsfknn)
+library(recipes)
+library(tibbletime)
+library(MLmetrics)
+```
+
+
+Leggo il dataset
+```{r}
+data <- read.csv2("time_series_dataset.csv", dec = ".")
+data$Data <- as.Date(data$Data, format = '%Y-%m-%d')
+print(head(data))
+```
+
+
+Divido il dataset in train set e test set. Di quest'ultimo faranno parte i dati degli ultimi due anni.
+```{r}
+ts <- xts(data$value, start=c(2010,1), order.by=data$Data)  #trasformo i dati in x time series
+
+# dati come xts
+train <- ts["2010-01-01/2016-12-31"]
+test2 <- ts["2017-01-01/2018-12-31"] 
+shift <- ts["2016-01-01/2016-12-31"]
+
+#dati come ts per produrre i grafici successivamente
+train_ts <- ts(train, start = 1, end = length(train),frequency = frequency(train)) 
+test_ts <- ts(test2, start = length(train)+1, end = length(test2)+length(train),frequency = frequency(test2))
+shift_ts <- ts(shift, start = length(ts["2010-01-01/2016-01-01"])+1, end = length(shift)+length(ts["2010-01-01/2016-01-01"])+1,frequency = frequency(shift))
+
+
+#dati come df
+traindf <- data %>%  dplyr::filter(Data <= ymd("2016-12-31"))
+testdf <- data %>%  dplyr::filter(Data > ymd("2016-12-31"))
+
+```
+
+
+Per quanto riguarda i modelli non lineari, il primo modello che si è deciso di provare è un algoritmo di K-Nearest Neighbour.
+Proviamo due diverse istanziazioni dell'algoritmo cambiando la strategia di Multiple-step-ahead: MIMO o recursive. Il valore di K è stato scelto in base alla radice del dataset di training.
+```{r, fig.height=5,fig.width=10}
+knn <- knn_forecasting(train_ts, h = 730, lags = 1:730,  k = 50, msas = "MIMO") 
+
+ggplot() +
+autolayer(test_ts, series="Data",size=1) +
+autolayer(knn$prediction,series="Fit",size=1.5) +
+xlab("Time") +
+ylab("Value")+
+ggtitle('KNN with MIMO VS real data')
+
+print(MAPE(knn$prediction, test_ts))
+```
+
+
+Istanziazione recursive:
+```{r, fig.height=5,fig.width=10}
+knn2 <- knn_forecasting(train_ts, h = 730, lags = 1:365,  k = 50, msas = "recursive") 
+
+ggplot() +
+autolayer(test_ts, series="Data",size=1) +
+autolayer(knn2$prediction,series="Fit",size=1) +
+xlab("Time") +
+ylab("Value")+
+ggtitle('KNN with recursive VS real data')
+
+print(MAPE(knn2$prediction, test_ts))
+```
+La seconda istanziazione è quella che performa meglio in termini di MAPE.
+
+Proseguiamo considerando due diversi tipi di Recurrent Neural Networks: Long Short Term Memory (LSTM) e Gated Recurrent Unit (GRU). La prima che si proverà è la LSTM.
+Prima di tutto è necessaria una fase di preprocessing sui dati.
+```{r}
+data <- read.csv2("time_series_dataset.csv", dec = ".")
+
+
+data <- data %>%
+    mutate(Data = as_date(Data))
+
+data <- data[-c(790, 2251),] #viene eliminato il 29 Feb
+
+train <- data[1:2555,] 
+test <- data[2556:3285,] 
+
+df <- bind_rows(
+    train %>% add_column(key = "train"),
+    test %>% add_column(key = "test"))
+```
+
+
+
+```{r}
+#riscalo e centro i dati
+df2 <- recipe(value ~ ., df) %>%
+    step_sqrt(value) %>%
+    step_center(value) %>%
+    step_scale(value) %>%
+    prep()
+
+rescaled <- bake(df2, df)
+
+
+center <- df2$steps[[2]]$means["value"] #valore per cui si è centrato
+scaling  <- df2$steps[[3]]$sds["value"] #valore per cui si è scalato
+```
+
+
+Parametri delle reti:
+```{r}
+lag_setting <- 730 
+batch_size <- 365          
+time_steps <- 1
+epochs <- 50
+```
+
+
+Affinchè le reti RNN possano sfruttare i dati, questi devono essere dei vettori tridimensionali comprendenti il valore dell'osservazione, il numero di lag e il numero di predittori.
+```{r}
+train_lag <- rescaled %>%
+    mutate(value_lag = lag(value, 365)) %>%
+    filter(!is.na(value_lag)) %>%
+    filter(key == "train")
+
+x_train <- array(data = train_lag$value_lag, dim = c(length(train_lag$value_lag), time_steps, 1))
+y_train <- array(data = train_lag$value, dim = c(length(train_lag$value), time_steps))
+
+test_lag <- rescaled %>%
+    mutate(value_lag = lag(value, 365)) %>%
+    filter(!is.na(value_lag)) %>%
+    filter(key == "test")
+
+x_test <- array(data = test_lag$value_lag, dim = c(length(test_lag$value_lag), time_steps, 1))
+y_test <- array(data = test_lag$value, dim = c(length(test_lag$value), time_steps))
+```
+
+
+LSTM
+```{r}
+mod_lstm <- keras_model_sequential()
+
+mod_lstm %>%
+    layer_lstm( units            = 100, 
+               input_shape      = c(time_steps, 1), 
+               batch_size       = batch_size,
+               stateful         = T,
+               return_sequences = T) %>%
+    layer_lstm(units            = 40,
+               stateful         = T,
+               return_sequences = T) %>%
+    layer_lstm(units            = 40,
+               stateful         = T,
+               return_sequences = F) %>%
+    layer_dense(units = 1) 
+
+mod_lstm %>% 
+    compile(loss = 'mae', optimizer = 'adam')
+
+mod_lstm
+```
+
+
+```{r}
+for (i in 1:epochs) {
+    mod_lstm %>% fit(x       = x_train, 
+                  y          = y_train, 
+                  batch_size = batch_size,
+                  epochs     = 1, 
+                  verbose    = 1, 
+                  shuffle    = FALSE)
+
+    cat("Epoch: ", i)
+}
+```
+
+
+Previsioni sul test set:
+```{r}
+pred_scaled_lstm <- mod_lstm %>% 
+    predict(x_test, batch_size = batch_size) %>%
+    .[,1] 
+
+pred_lstm <- tibble(
+    Data   = test_lag$Data,
+    value   = (pred_scaled_lstm * scaling + center)^2
+) 
+
+ggplot() +
+autolayer(ts(test$value), series="Data",size=1) +
+autolayer(ts(pred_lstm$value),series="Fit",size=1) +
+xlab("Time") +
+ylab("Value")+
+ggtitle('LSTM VS real data')
+
+print(MAPE(pred_lstm$value, test_ts))
+```
+
+
+GRU
+```{r}
+mod_gru <- keras_model_sequential()
+
+mod_gru %>%
+    layer_gru( units            = 100, 
+               input_shape      = c(time_steps, 1), 
+               batch_size       = batch_size,
+               stateful         = T,
+               return_sequences = T) %>%
+    layer_gru( units            = 40,
+               stateful         = T,
+               return_sequences = T) %>%
+    layer_gru( units            = 40,
+               stateful         = T,
+               return_sequences = F) %>%
+    layer_dense(units = 1)
+
+mod_gru %>% 
+    compile(loss = 'mae', optimizer = 'adam') 
+
+mod_gru
+```
+
+
+
+```{r}
+for (i in 1:epochs) {
+    mod_gru %>% fit(x        = x_train, 
+                  y          = y_train, 
+                  batch_size = batch_size,
+                  epochs     = 1, 
+                  verbose    = 1, 
+                  shuffle    = FALSE)
+
+    cat("Epoch: ", i)
+    
+}
+```
+
+
+
+Previsioni sul test set:
+```{r, fig.height=6,fig.width=11}
+pred_scaled_gru <- mod_gru %>% 
+    predict(x_test, batch_size = batch_size) %>%
+    .[,1] 
+
+pred_gru <- tibble(
+    Data   = test_lag$Data,
+    value   = (pred_scaled_gru * scaling + center)^2
+) 
+
+ggplot() +
+autolayer(ts(test$value), series="Data",size=1) +
+autolayer(ts(pred_gru$value),series="Fit",size=1) +
+xlab("Time") +
+ylab("Value")+
+ggtitle('GRU VS real data')
+
+print(MAPE(pred_gru$value, test_ts))
+```
+Tra le due reti quella migliore sembra essere la LSTM. Globalmente, il modello migliore tra quelli non lineari, risulta essere l'algoritmo k-nearest neighbours, con l'istanziazione recursive, il quale ottiene un valore di MAPE ottimale.
+
+
+Andiamo quindi a prevedere i valori dal 1-Gen-2019 al 30-Nov-2019 con questo modello:
+```{r, fig.height=6,fig.width=11}
+pred_ML <- knn_forecasting(ts(data$value, frequency = 7), h = 334, lags = 1:365, k = 50, msas = "recursive")
+
+autoplot(ts(test2, start = length(train)+1+430, end = length(test2)+length(train),frequency = frequency(test2)),size=0.7) +
+autolayer(ts(pred_ML$prediction, start = (length(train)+length(test2)+1)), series="Forecast",size=1)+
+xlab("Time") +
+ylab("Value")+
+ggtitle('Forecast with KNN')
+```
+
+
+Scriviamo i dati previsti nel file csv.
+```{r}
+prev <- read.csv("SDMTSA_790544_1.csv", sep = ",", dec = ".")
+prev <- as.data.frame(prev)
+prev$ML <- pred_ML$prediction
+
+write.csv(prev, file="SDMTSA_790544_1.csv", row.names = FALSE , dec = ".")
+```
+
+
+Infine, mostriamo i grafici delle previsioni che sono state effettuate con i diversi metodi:
+```{r, fig.height = 5, fig.width = 11}
+d <- read.csv("SDMTSA_790544_1.csv", sep = ",", dec = ".")
+
+autoplot(ts(d$ARIMA, start = 1),size=1,color ="steelblue2") +
+xlab("Time") +
+ylab("Value")+
+ggtitle('Forecast with ARIMA(6,0,7)(1,1,1)[7]')
+autoplot(ts(d$UCM, start = 1),size=1,color ="orangered") +
+xlab("Time") +
+ylab("Value")+
+ggtitle('Forecast with UCM')
+autoplot(ts(d$ML, start = 1),size=1,color = "forestgreen") +
+xlab("Time") +
+ylab("Value")+
+ggtitle('Forecast with KNN')
+```
+
+
+
